@@ -4,9 +4,12 @@ import cv2
 import numpy as np
 import pandas as pd
 import shutil
+import json
+import math
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QFileDialog, 
-                             QStatusBar, QMessageBox, QFrame, QSizePolicy)
+                             QStatusBar, QMessageBox, QFrame, QSizePolicy,
+                             QInputDialog)
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPoint, QRect
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QBrush
 
@@ -66,6 +69,7 @@ class AnnotationCanvas(QLabel):
     """
     # Signals to communicate with MainWindow
     annotation_created = pyqtSignal(dict) # {mode, x, y, w, h}
+    calibration_created = pyqtSignal(int, int, int, int) # x1, y1, x2, y2 in video coords
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -75,7 +79,7 @@ class AnnotationCanvas(QLabel):
         self.setStyleSheet("background-color: #222;") # Dark background for canvas
 
         self.current_frame_image = None # QPixmap
-        self.mode = "point" # "point" or "bbox"
+        self.mode = "point" # "point", "bbox", or "calibrate"
         
         # Drawing state
         self.drawing = False
@@ -83,14 +87,18 @@ class AnnotationCanvas(QLabel):
         self.end_point = QPoint()
         self.current_annotation = None # Existing annotation for this frame (dict)
         
+        # Calibration line to show (video coords: x1, y1, x2, y2) or None
+        self.calibration_line = None
+        
         # Scaling factors (displayed size vs actual video size)
         self.scale_factor = 1.0
         self.offset_x = 0
         self.offset_y = 0
 
-    def set_frame(self, frame_rgb, annotation=None):
+    def set_frame(self, frame_rgb, annotation=None, calibration_line=None):
         """Displays a new frame and any existing annotation."""
         self.current_annotation = annotation
+        self.calibration_line = calibration_line
         
         if frame_rgb is not None:
             height, width, channel = frame_rgb.shape
@@ -139,14 +147,31 @@ class AnnotationCanvas(QLabel):
             # Draw temporary annotation (while dragging bbox)
             if self.drawing and self.mode == "bbox":
                 rect = self._get_rect_from_points(self.start_point, self.end_point)
-                # We need to draw this in screen coordinates directly, 
-                # but based on the start/end points which are already screen interactions.
-                # However, drawing logic expects valid video coordinates usually? 
-                # Actually simpler: draw directly in screen coords for preview.
                 pen = QPen(Qt.green, 2, Qt.SolidLine)
                 painter.setPen(pen)
                 painter.setBrush(Qt.NoBrush)
                 painter.drawRect(rect)
+
+            # Draw temporary calibration line (while dragging)
+            if self.drawing and self.mode == "calibrate":
+                pen = QPen(Qt.cyan, 2, Qt.DashLine)
+                painter.setPen(pen)
+                painter.drawLine(self.start_point, self.end_point)
+
+            # Draw saved calibration line
+            if self.calibration_line:
+                cx1, cy1, cx2, cy2 = self.calibration_line
+                sx1 = int(cx1 * self.scale_factor) + self.offset_x
+                sy1 = int(cy1 * self.scale_factor) + self.offset_y
+                sx2 = int(cx2 * self.scale_factor) + self.offset_x
+                sy2 = int(cy2 * self.scale_factor) + self.offset_y
+                pen = QPen(Qt.cyan, 2, Qt.SolidLine)
+                painter.setPen(pen)
+                painter.drawLine(sx1, sy1, sx2, sy2)
+                # Small circles at endpoints
+                painter.setBrush(QColor(0, 255, 255, 150))
+                painter.drawEllipse(QPoint(sx1, sy1), 4, 4)
+                painter.drawEllipse(QPoint(sx2, sy2), 4, 4)
 
     def _draw_annotation(self, painter, ann, is_preview=False):
         """Helper to draw a specific annotation dict."""
@@ -185,27 +210,28 @@ class AnnotationCanvas(QLabel):
                 self.end_point = pos
                 
                 if self.mode == "point":
-                    # For point, we just click. We can handle it on release or press.
-                    # Let's handle immediate commit for point
                     self._commit_annotation(pos)
                     self.drawing = False # No drag for point
+                # calibrate and bbox both use drag, handled on release
 
     def mouseMoveEvent(self, event):
-        if self.drawing and self.mode == "bbox":
+        if self.drawing and self.mode in ("bbox", "calibrate"):
             self.end_point = event.pos()
             self.update() # Repaint for preview
 
     def mouseReleaseEvent(self, event):
-        if self.drawing and self.mode == "bbox" and event.button() == Qt.LeftButton:
-            self.drawing = False
-            self.end_point = event.pos()
-            
+        if not self.drawing or event.button() != Qt.LeftButton:
+            return
+
+        self.drawing = False
+        self.end_point = event.pos()
+
+        if self.mode == "bbox":
             # Normalize rect
             rect = self._get_rect_from_points(self.start_point, self.end_point)
             
             # If rect is too small, ignore
             if rect.width() > 5 and rect.height() > 5:
-                # Convert screen rect to logical video coords
                 video_rect = self._screen_to_video_rect(rect)
                 if video_rect:
                     self.annotation_created.emit({
@@ -215,6 +241,14 @@ class AnnotationCanvas(QLabel):
                         "w": video_rect[2],
                         "h": video_rect[3]
                     })
+
+        elif self.mode == "calibrate":
+            # Convert both endpoints to video coordinates
+            vx1, vy1 = self._screen_to_video_coords(self.start_point)
+            vx2, vy2 = self._screen_to_video_coords(self.end_point)
+            pixel_dist = math.hypot(vx2 - vx1, vy2 - vy1)
+            if pixel_dist > 5:  # Ignore tiny lines
+                self.calibration_created.emit(vx1, vy1, vx2, vy2)
 
     def _commit_annotation(self, pos):
         """Converts screen point to video coordinates and emits signal."""
@@ -275,6 +309,14 @@ class MainWindow(QMainWindow):
         self.annotations = {} # { frame_idx: {mode, x, y, w, h} }
         self.current_frame = 0
 
+        # Calibration state
+        # calibration_line: (x1, y1, x2, y2) in video pixel coords
+        self.calibration_line = None
+        # pixels_per_meter: computed from calibration
+        self.pixels_per_meter = None
+        # The mode we return to after calibration
+        self._pre_calibrate_mode = "point"
+
         self.setup_ui()
         self.update_ui_state(has_video=False)
 
@@ -316,6 +358,14 @@ class MainWindow(QMainWindow):
         self.btn_clear_all.setFocusPolicy(Qt.NoFocus)
         self.btn_clear_all.clicked.connect(self.clear_all_annotations)
 
+        # Calibration button
+        self.btn_calibrate = QPushButton("Calibrate Scale")
+        self.btn_calibrate.setFocusPolicy(Qt.NoFocus)
+        self.btn_calibrate.clicked.connect(self.enter_calibrate_mode)
+
+        self.lbl_calibration_info = QLabel("")
+        self.lbl_calibration_info.setStyleSheet("color: cyan; font-weight: bold;")
+
         # Add widgets to toolbar
         toolbar_layout.addWidget(self.btn_open)
         toolbar_layout.addWidget(self.btn_save_csv)
@@ -334,6 +384,9 @@ class MainWindow(QMainWindow):
         toolbar_layout.addWidget(self.btn_open_project)
 
         toolbar_layout.addStretch() # Spacer
+        toolbar_layout.addWidget(self.btn_calibrate)
+        toolbar_layout.addWidget(self.lbl_calibration_info)
+        toolbar_layout.addSpacing(10)
         toolbar_layout.addWidget(self.lbl_mode)
         toolbar_layout.addWidget(self.btn_mode_toggle)
         toolbar_layout.addSpacing(20)
@@ -354,6 +407,7 @@ class MainWindow(QMainWindow):
         
         self.canvas = AnnotationCanvas()
         self.canvas.annotation_created.connect(self.add_annotation)
+        self.canvas.calibration_created.connect(self.finish_calibration)
         canvas_layout.addWidget(self.canvas)
         
         main_layout.addWidget(frame_canvas, stretch=1)
@@ -370,10 +424,8 @@ class MainWindow(QMainWindow):
         """Enables/disables buttons based on video state."""
         self.btn_save_csv.setEnabled(has_video)
         self.btn_export_video.setEnabled(has_video)
-        self.btn_save_project.setEnabled(has_video) # Only save if video loaded
-        # btn_open_project should always be enabled? No, it's like Open Video.
-        # But wait, it's in the toolbar. It should be enabled even if no video.
-        
+        self.btn_save_project.setEnabled(has_video)
+        self.btn_calibrate.setEnabled(has_video)
         self.btn_mode_toggle.setEnabled(has_video)
         self.btn_clear_frame.setEnabled(has_video)
         self.btn_clear_all.setEnabled(has_video)
@@ -383,6 +435,8 @@ class MainWindow(QMainWindow):
             self.canvas.setStyleSheet("QLabel { color : white; font-size: 16px; background-color: #222; }")
         else:
             self.canvas.setText("")
+        
+        self._update_calibration_label()
 
     def toggle_mode(self):
         if self.btn_mode_toggle.isChecked():
@@ -393,12 +447,55 @@ class MainWindow(QMainWindow):
             self.canvas.mode = "point"
         self.update_status()
 
+    # -------------------------------------------------------------------------
+    # Calibration
+    # -------------------------------------------------------------------------
+    def enter_calibrate_mode(self):
+        """Switch to calibrate mode so the next drag draws a reference line."""
+        self._pre_calibrate_mode = self.canvas.mode
+        self.canvas.mode = "calibrate"
+        self.status_bar.showMessage(
+            "CALIBRATE: Draw a line across a known-length object, then enter its real size.",
+            10000)
+
+    def finish_calibration(self, x1, y1, x2, y2):
+        """Called when user finishes drawing the calibration line."""
+        pixel_dist = math.hypot(x2 - x1, y2 - y1)
+
+        real_length, ok = QInputDialog.getDouble(
+            self, "Calibration",
+            "Enter the real-life length of this line (in meters):",
+            value=1.0, min=0.0001, max=100000.0, decimals=4)
+
+        if ok and real_length > 0:
+            self.calibration_line = (x1, y1, x2, y2)
+            self.pixels_per_meter = pixel_dist / real_length
+            self.status_bar.showMessage(
+                f"Calibrated: {self.pixels_per_meter:.2f} px/m  "
+                f"({pixel_dist:.1f} px = {real_length} m)", 5000)
+        else:
+            self.status_bar.showMessage("Calibration cancelled.", 3000)
+
+        # Restore previous mode
+        self.canvas.mode = self._pre_calibrate_mode
+        self.show_frame()
+        self._update_calibration_label()
+
+    def _update_calibration_label(self):
+        if self.pixels_per_meter:
+            self.lbl_calibration_info.setText(
+                f"Scale: {self.pixels_per_meter:.1f} px/m")
+        else:
+            self.lbl_calibration_info.setText("")
+
     def open_video(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open Video", "", "Video Files (*.mp4 *.avi *.mov *.mkv)")
         if path:
             if self.video_manager.load_video(path):
                 self.current_frame = 0
                 self.annotations = {}
+                self.calibration_line = None
+                self.pixels_per_meter = None
                 self.update_ui_state(has_video=True)
                 self.show_frame()
                 self.update_status()
@@ -409,9 +506,9 @@ class MainWindow(QMainWindow):
         """Gets frame from manager and updates canvas."""
         frame = self.video_manager.get_frame(self.current_frame)
         if frame is not None:
-            # Check if we have an annotation for this frame
             ann = self.annotations.get(self.current_frame)
-            self.canvas.set_frame(frame, annotation=ann)
+            self.canvas.set_frame(frame, annotation=ann,
+                                  calibration_line=self.calibration_line)
         else:
             self.status_bar.showMessage("Error reading frame", 3000)
 
@@ -436,6 +533,9 @@ class MainWindow(QMainWindow):
         confirm = QMessageBox.question(self, "Confirm", "Clear ALL annotations?", QMessageBox.Yes | QMessageBox.No)
         if confirm == QMessageBox.Yes:
             self.annotations = {}
+            self.calibration_line = None
+            self.pixels_per_meter = None
+            self._update_calibration_label()
             self.show_frame()
 
     # -------------------------------------------------------------------------
@@ -472,11 +572,65 @@ class MainWindow(QMainWindow):
         info = f"Frame: {self.current_frame + 1} / {self.video_manager.total_frames}"
         mode_str = f"Mode: {self.canvas.mode.upper()}"
         ann_count = f"Annotations: {len(self.annotations)}"
-        self.status_label.setText(f"{info} | {mode_str} | {ann_count}")
+        cal_str = "Calibrated" if self.pixels_per_meter else "Not calibrated"
+        self.status_label.setText(f"{info} | {mode_str} | {ann_count} | {cal_str}")
 
     # -------------------------------------------------------------------------
     # Export
     # -------------------------------------------------------------------------
+    def _build_annotations_dataframe(self):
+        """Build a DataFrame from annotations, with optional real-world columns."""
+        data = []
+        ppm = self.pixels_per_meter
+        sorted_frames = sorted(self.annotations.keys())
+        prev_x, prev_y = None, None
+        cumulative_dist_m = 0.0
+
+        for fid in sorted_frames:
+            ann = self.annotations[fid]
+            row = {
+                "frame": fid,
+                "mode": ann["mode"],
+                "x": ann["x"],
+                "y": ann["y"],
+                "width": ann["w"],
+                "height": ann["h"],
+            }
+
+            if ppm:
+                row["x_m"] = round(ann["x"] / ppm, 6)
+                row["y_m"] = round(ann["y"] / ppm, 6)
+                if ann["mode"] == "bbox":
+                    row["width_m"] = round(ann["w"] / ppm, 6)
+                    row["height_m"] = round(ann["h"] / ppm, 6)
+                else:
+                    row["width_m"] = 0
+                    row["height_m"] = 0
+
+                # Distance from previous annotated frame (point mode)
+                if ann["mode"] == "point" and prev_x is not None:
+                    d_px = math.hypot(ann["x"] - prev_x, ann["y"] - prev_y)
+                    d_m = d_px / ppm
+                    cumulative_dist_m += d_m
+                    row["dist_from_prev_m"] = round(d_m, 6)
+                else:
+                    row["dist_from_prev_m"] = 0
+                row["cumulative_dist_m"] = round(cumulative_dist_m, 6)
+            else:
+                row["x_m"] = ""
+                row["y_m"] = ""
+                row["width_m"] = ""
+                row["height_m"] = ""
+                row["dist_from_prev_m"] = ""
+                row["cumulative_dist_m"] = ""
+
+            if ann["mode"] == "point":
+                prev_x, prev_y = ann["x"], ann["y"]
+
+            data.append(row)
+
+        return pd.DataFrame(data)
+
     def save_csv(self):
         if not self.annotations:
             QMessageBox.information(self, "Info", "No annotations to save.")
@@ -484,20 +638,7 @@ class MainWindow(QMainWindow):
 
         path, _ = QFileDialog.getSaveFileName(self, "Save CSV", "", "CSV Files (*.csv)")
         if path:
-            data = []
-            # Sort by frame index
-            for fid in sorted(self.annotations.keys()):
-                ann = self.annotations[fid]
-                data.append({
-                    "frame": fid,
-                    "mode": ann["mode"],
-                    "x": ann["x"],
-                    "y": ann["y"],
-                    "width": ann["w"],
-                    "height": ann["h"]
-                })
-            
-            df = pd.DataFrame(data)
+            df = self._build_annotations_dataframe()
             try:
                 df.to_csv(path, index=False)
                 QMessageBox.information(self, "Success", f"Saved {len(df)} annotations to {path}")
@@ -512,44 +653,145 @@ class MainWindow(QMainWindow):
         if not output_path:
             return
 
+        ppm = self.pixels_per_meter
+        fps = self.video_manager.fps
+
+        # Pre-compute per-frame real-world data so we can show cumulative info
+        # as each frame is rendered.
+        sorted_ann_frames = sorted(self.annotations.keys())
+        frame_realdata = {}  # frame_idx -> {pos_m, step_m, cumul_m, speed_mps}
+        prev_x, prev_y = None, None
+        prev_fid = None
+        cumul_m = 0.0
+        trail_points = []  # list of (x, y) in pixel coords for path drawing
+
+        for fid in sorted_ann_frames:
+            ann = self.annotations[fid]
+            rd = {"pos_m": None, "step_m": 0.0, "cumul_m": 0.0, "speed_mps": 0.0}
+
+            if ann["mode"] == "point":
+                trail_points_snapshot = list(trail_points) + [(ann["x"], ann["y"])]
+
+                if ppm:
+                    rd["pos_m"] = (ann["x"] / ppm, ann["y"] / ppm)
+
+                    if prev_x is not None:
+                        d_px = math.hypot(ann["x"] - prev_x, ann["y"] - prev_y)
+                        d_m = d_px / ppm
+                        cumul_m += d_m
+                        rd["step_m"] = d_m
+
+                        # Speed: distance / time between frames
+                        if fps > 0 and prev_fid is not None:
+                            dt = (fid - prev_fid) / fps
+                            if dt > 0:
+                                rd["speed_mps"] = d_m / dt
+
+                    rd["cumul_m"] = cumul_m
+
+                prev_x, prev_y = ann["x"], ann["y"]
+                prev_fid = fid
+                trail_points.append((ann["x"], ann["y"]))
+            else:
+                trail_points_snapshot = list(trail_points)
+
+            rd["trail"] = trail_points_snapshot
+            frame_realdata[fid] = rd
+
+        # For frames between annotations, carry the last known data forward
+        # so the HUD doesn't disappear. Build a lookup.
+        last_rd = {"pos_m": None, "step_m": 0.0, "cumul_m": 0.0,
+                    "speed_mps": 0.0, "trail": []}
+
         # Prepare writer
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_path, fourcc, self.video_manager.fps, 
+        out = cv2.VideoWriter(output_path, fourcc, fps,
                               (self.video_manager.width, self.video_manager.height))
 
-        # We iterate all frames essentially re-reading the video
-        # This might be slow but it's robust
         self.status_bar.showMessage("Exporting video... please wait.")
         QApplication.processEvents()
 
-        # Create a temp capture to not mess with the UI one
         temp_cap = cv2.VideoCapture(self.video_manager.video_path)
-        
         frame_idx = 0
         total = int(temp_cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        
+        vid_w = self.video_manager.width
+        vid_h = self.video_manager.height
+
         while True:
             ret, frame = temp_cap.read()
             if not ret:
                 break
-            
+
+            # Update last_rd if this frame has data
+            if frame_idx in frame_realdata:
+                last_rd = frame_realdata[frame_idx]
+
+            # -- Draw annotation overlays --
             if frame_idx in self.annotations:
                 ann = self.annotations[frame_idx]
                 if ann['mode'] == 'point':
-                    # Draw red circle
                     cv2.circle(frame, (ann['x'], ann['y']), 5, (0, 0, 255), -1)
                 elif ann['mode'] == 'bbox':
-                    # Draw green rect
                     x, y, w, h = ann['x'], ann['y'], ann['w'], ann['h']
                     cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
 
-            # Draw frame number
-            cv2.putText(frame, f"Frame: {frame_idx}", (10, 30), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            # -- Draw trailing path --
+            trail = last_rd.get("trail", [])
+            if len(trail) > 1:
+                for i in range(1, len(trail)):
+                    pt1 = (int(trail[i-1][0]), int(trail[i-1][1]))
+                    pt2 = (int(trail[i][0]), int(trail[i][1]))
+                    cv2.line(frame, pt1, pt2, (255, 100, 100), 2)
+                # Draw dots on trail
+                for pt in trail:
+                    cv2.circle(frame, (int(pt[0]), int(pt[1])), 3, (255, 150, 150), -1)
+
+            # -- Draw calibration line --
+            if self.calibration_line:
+                cx1, cy1, cx2, cy2 = self.calibration_line
+                cv2.line(frame, (cx1, cy1), (cx2, cy2), (255, 255, 0), 2)
+
+            # -- Draw HUD panel (top-left) --
+            # Semi-transparent background for readability
+            panel_h = 160 if ppm else 50
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (0, 0), (380, panel_h), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+
+            y_text = 25
+            cv2.putText(frame, f"Frame: {frame_idx}", (10, y_text),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+            y_text += 28
+
+            if ppm:
+                cv2.putText(frame, f"Scale: {ppm:.1f} px/m",
+                            (10, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                            (0, 255, 255), 1)
+                y_text += 25
+
+                pos = last_rd.get("pos_m")
+                if pos:
+                    cv2.putText(frame, f"Pos: ({pos[0]:.3f}, {pos[1]:.3f}) m",
+                                (10, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                                (200, 200, 255), 1)
+                    y_text += 25
+
+                step = last_rd.get("step_m", 0)
+                cumul = last_rd.get("cumul_m", 0)
+                speed = last_rd.get("speed_mps", 0)
+
+                cv2.putText(frame, f"Step: {step:.4f} m | Total: {cumul:.4f} m",
+                            (10, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                            (100, 255, 100), 1)
+                y_text += 25
+
+                cv2.putText(frame, f"Speed: {speed:.4f} m/s",
+                            (10, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                            (100, 200, 255), 1)
 
             out.write(frame)
             frame_idx += 1
-            
+
             if frame_idx % 50 == 0:
                 self.status_bar.showMessage(f"Exporting... {frame_idx}/{total}")
                 QApplication.processEvents()
@@ -583,26 +825,23 @@ class MainWindow(QMainWindow):
         try:
             # 1. Save CSV
             csv_path = os.path.join(project_dir, "annotations.csv")
-            data = []
-            for fid in sorted(self.annotations.keys()):
-                ann = self.annotations[fid]
-                data.append({
-                    "frame": fid,
-                    "mode": ann["mode"],
-                    "x": ann["x"],
-                    "y": ann["y"],
-                    "width": ann["w"],
-                    "height": ann["h"]
-                })
-            df = pd.DataFrame(data)
+            df = self._build_annotations_dataframe()
             df.to_csv(csv_path, index=False)
 
-            # 2. Copy Video
-            # We use the original filename
+            # 2. Save calibration metadata
+            meta = {}
+            if self.calibration_line:
+                meta["calibration_line"] = list(self.calibration_line)
+            if self.pixels_per_meter:
+                meta["pixels_per_meter"] = self.pixels_per_meter
+            meta_path = os.path.join(project_dir, "calibration.json")
+            with open(meta_path, "w") as f:
+                json.dump(meta, f, indent=2)
+
+            # 3. Copy Video
             original_filename = os.path.basename(self.video_manager.video_path)
             dest_video_path = os.path.join(project_dir, original_filename)
             
-            # Only copy if source and dest are different
             if os.path.abspath(self.video_manager.video_path) != os.path.abspath(dest_video_path):
                 self.status_bar.showMessage("Copying video file... please wait.")
                 QApplication.processEvents()
@@ -648,11 +887,22 @@ class MainWindow(QMainWindow):
             if self.video_manager.load_video(video_file):
                 self.current_frame = 0
                 self.annotations = {}
+                self.calibration_line = None
+                self.pixels_per_meter = None
                 
+                # Load calibration metadata if it exists
+                meta_path = os.path.join(project_dir, "calibration.json")
+                if os.path.exists(meta_path):
+                    with open(meta_path, "r") as f:
+                        meta = json.load(f)
+                    if "calibration_line" in meta:
+                        self.calibration_line = tuple(meta["calibration_line"])
+                    if "pixels_per_meter" in meta:
+                        self.pixels_per_meter = meta["pixels_per_meter"]
+
                 # Load Annotations if CSV exists
                 if csv_file:
                     df = pd.read_csv(csv_file)
-                    # Expected columns: frame, mode, x, y, width, height
                     for _, row in df.iterrows():
                         self.annotations[int(row['frame'])] = {
                             "mode": row['mode'],
