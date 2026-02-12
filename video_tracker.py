@@ -3,6 +3,7 @@ import os
 import cv2
 import numpy as np
 import pandas as pd
+import shutil
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QFileDialog, 
                              QStatusBar, QMessageBox, QFrame, QSizePolicy)
@@ -319,6 +320,19 @@ class MainWindow(QMainWindow):
         toolbar_layout.addWidget(self.btn_open)
         toolbar_layout.addWidget(self.btn_save_csv)
         toolbar_layout.addWidget(self.btn_export_video)
+        
+        # Project Management
+        self.btn_save_project = QPushButton("Save Project Folder")
+        self.btn_save_project.setFocusPolicy(Qt.NoFocus)
+        self.btn_save_project.clicked.connect(self.save_project_folder)
+        
+        self.btn_open_project = QPushButton("Open Project Folder")
+        self.btn_open_project.setFocusPolicy(Qt.NoFocus)
+        self.btn_open_project.clicked.connect(self.open_project_folder)
+        
+        toolbar_layout.addWidget(self.btn_save_project)
+        toolbar_layout.addWidget(self.btn_open_project)
+
         toolbar_layout.addStretch() # Spacer
         toolbar_layout.addWidget(self.lbl_mode)
         toolbar_layout.addWidget(self.btn_mode_toggle)
@@ -356,12 +370,16 @@ class MainWindow(QMainWindow):
         """Enables/disables buttons based on video state."""
         self.btn_save_csv.setEnabled(has_video)
         self.btn_export_video.setEnabled(has_video)
+        self.btn_save_project.setEnabled(has_video) # Only save if video loaded
+        # btn_open_project should always be enabled? No, it's like Open Video.
+        # But wait, it's in the toolbar. It should be enabled even if no video.
+        
         self.btn_mode_toggle.setEnabled(has_video)
         self.btn_clear_frame.setEnabled(has_video)
         self.btn_clear_all.setEnabled(has_video)
         
         if not has_video:
-            self.canvas.setText("No Video Loaded. Click 'Open Video'.")
+            self.canvas.setText("No Video Loaded. Click 'Open Video' or 'Open Project'.")
             self.canvas.setStyleSheet("QLabel { color : white; font-size: 16px; background-color: #222; }")
         else:
             self.canvas.setText("")
@@ -540,6 +558,124 @@ class MainWindow(QMainWindow):
         out.release()
         self.status_bar.showMessage("Export complete!", 5000)
         QMessageBox.information(self, "Success", f"Video exported to {output_path}")
+
+    # -------------------------------------------------------------------------
+    # Project Management
+    # -------------------------------------------------------------------------
+    def save_project_folder(self):
+        if not self.video_manager.cap or not self.video_manager.video_path:
+            QMessageBox.warning(self, "Warning", "No video loaded to save.")
+            return
+
+        # Let user choose a directory. 
+        # Ideally, we create a new folder inside it.
+        parent_dir = QFileDialog.getExistingDirectory(self, "Select Parent Directory to Create Project Folder")
+        if not parent_dir:
+            return
+
+        # Ask for project name
+        # Simple input dialog would be nice, but standard QFileDialog doesn't do "New Folder Name" well.
+        # We'll assume the user created the folder in the dialog, OR we can just save directly into the chosen dir.
+        # Let's verify if the chosen dir is empty or ask.
+        # Actually simplest: "Save Project" -> choose a folder (e.g. "MyProject"). We dump files in there.
+        project_dir = parent_dir # User should have created/selected the specific folder
+
+        try:
+            # 1. Save CSV
+            csv_path = os.path.join(project_dir, "annotations.csv")
+            data = []
+            for fid in sorted(self.annotations.keys()):
+                ann = self.annotations[fid]
+                data.append({
+                    "frame": fid,
+                    "mode": ann["mode"],
+                    "x": ann["x"],
+                    "y": ann["y"],
+                    "width": ann["w"],
+                    "height": ann["h"]
+                })
+            df = pd.DataFrame(data)
+            df.to_csv(csv_path, index=False)
+
+            # 2. Copy Video
+            # We use the original filename
+            original_filename = os.path.basename(self.video_manager.video_path)
+            dest_video_path = os.path.join(project_dir, original_filename)
+            
+            # Only copy if source and dest are different
+            if os.path.abspath(self.video_manager.video_path) != os.path.abspath(dest_video_path):
+                self.status_bar.showMessage("Copying video file... please wait.")
+                QApplication.processEvents()
+                shutil.copy2(self.video_manager.video_path, dest_video_path)
+            
+            self.status_bar.showMessage("Project saved successfully!", 5000)
+            QMessageBox.information(self, "Success", f"Project saved to:\n{project_dir}")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save project: {str(e)}")
+            self.status_bar.showMessage("Error saving project.")
+
+    def open_project_folder(self):
+        project_dir = QFileDialog.getExistingDirectory(self, "Select Project Folder")
+        if not project_dir:
+            return
+
+        try:
+            # Find video file
+            video_extensions = ['.mp4', '.avi', '.mov', '.mkv']
+            video_file = None
+            for f in os.listdir(project_dir):
+                if any(f.lower().endswith(ext) for ext in video_extensions):
+                    video_file = os.path.join(project_dir, f)
+                    break
+            
+            if not video_file:
+                QMessageBox.critical(self, "Error", "No video file found in this folder.")
+                return
+
+            # Find CSV
+            csv_file = os.path.join(project_dir, "annotations.csv")
+            if not os.path.exists(csv_file):
+                # Try finding any csv?
+                csv_candidates = [f for f in os.listdir(project_dir) if f.endswith('.csv')]
+                if csv_candidates:
+                    csv_file = os.path.join(project_dir, csv_candidates[0])
+                else:
+                    QMessageBox.warning(self, "Warning", "No annotations.csv found. Opening video only.")
+                    csv_file = None
+
+            # Load Video
+            if self.video_manager.load_video(video_file):
+                self.current_frame = 0
+                self.annotations = {}
+                
+                # Load Annotations if CSV exists
+                if csv_file:
+                    df = pd.read_csv(csv_file)
+                    # Expected columns: frame, mode, x, y, width, height
+                    for _, row in df.iterrows():
+                        self.annotations[int(row['frame'])] = {
+                            "mode": row['mode'],
+                            "x": int(row['x']),
+                            "y": int(row['y']),
+                            "w": int(row['width']),
+                            "h": int(row['height'])
+                        }
+                    
+                    # Jump to last annotated frame
+                    if self.annotations:
+                        last_frame = max(self.annotations.keys())
+                        self.current_frame = last_frame
+                
+                self.update_ui_state(has_video=True)
+                self.show_frame()
+                self.update_status()
+                self.status_bar.showMessage(f"Project loaded from {project_dir}", 5000)
+            else:
+                QMessageBox.critical(self, "Error", "Could not load video file.")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load project: {str(e)}")
 
 def main():
     app = QApplication(sys.argv)
