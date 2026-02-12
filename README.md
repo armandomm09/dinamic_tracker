@@ -1,5 +1,16 @@
 # Dynamic Tracker
 
+## 👥 Team
+
+**Team:** dinamica-ps1 2 
+**Course:** T3001B - Foundation of Robotics Gpo 101
+
+| Name | Matricula |
+|------|-----------|
+| Hector Eduardo Tovar Mendoza Tovar | A00840308 |
+| Pablo Armando Mac Beath Milián  | A01735082 | 
+| Rafael André Gamiz Salazar | A00838280 | 
+
 ## Setup
 
 ### Create conda environment
